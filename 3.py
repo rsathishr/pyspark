@@ -1,60 +1,208 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, year, sum as _sum, round as _round, desc
+from pyspark.sql.functions import col, sum, year, bround, row_number
+from pyspark.sql.types import DecimalType
 from pyspark.sql.window import Window
-from pyspark.sql.functions import row_number
 
-# Start Spark session
 spark = SparkSession.builder.getOrCreate()
 
-# Load CSVs (assuming no headers)
-orders = spark.read.csv("orders.csv", header=False, inferSchema=True).toDF("order_id", "order_date", "customer_id", "order_status")
-order_items = spark.read.csv("order_items.csv", header=False, inferSchema=True).toDF("order_item_id", "order_id", "product_id", "quantity", "total_price", "unit_price")
-products = spark.read.csv("products.csv", header=False, inferSchema=True).toDF("product_id", "category_id", "product", "type", "unit_price", "url")
-categories = spark.read.csv("categories.csv", header=False, inferSchema=True).toDF("category_id", "department_id", "category")
-departments = spark.read.csv("departments.csv", header=False, inferSchema=True).toDF("department_id", "department")
-customers = spark.read.csv("customers.csv", header=False, inferSchema=True).toDF("customer_id", "first_name", "last_name", "email", "phone", "address", "city", "state", "zip")
+# --------------------------------------------------
+# 1. Read CSV files (NO HEADERS)
+# --------------------------------------------------
 
-# Filter orders with status COMPLETE
-orders_filtered = orders.filter(col("order_status") == "COMPLETE")
+orders = spark.read.csv("orders.csv", inferSchema=True) \
+    .toDF("order_id", "order_date", "customer_id", "order_status")
 
-# Join all datasets
-joined = orders_filtered.join(order_items, "order_id") \
+order_items = spark.read.csv("order_items.csv", inferSchema=True) \
+    .toDF("order_item_id", "order_id", "product_id", "quantity", "total_price", "unit_price")
+
+products = spark.read.csv("products.csv", inferSchema=True) \
+    .toDF("product_id", "category_id", "product", "type", "unit_price", "url")
+
+categories = spark.read.csv("categories.csv", inferSchema=True) \
+    .toDF("category_id", "department_id", "category")
+
+departments = spark.read.csv("departments.csv", inferSchema=True) \
+    .toDF("department_id", "department")
+
+customers = spark.read.csv("customers.csv", inferSchema=True) \
+    .toDF(
+        "customer_id", "first_name", "last_name", "email",
+        "phone", "address", "city", "state", "zip"
+    )
+
+# --------------------------------------------------
+# 2. Filter COMPLETE orders for 2013 & 2014
+# --------------------------------------------------
+
+orders_filtered = orders \
+    .filter(col("order_status") == "COMPLETE") \
+    .withColumn("year", year(col("order_date"))) \
+    .filter(col("year").isin(2013, 2014))
+
+# --------------------------------------------------
+# 3. Join all tables (ER Diagram order)
+# --------------------------------------------------
+
+joined_df = orders_filtered \
+    .join(customers, "customer_id") \
+    .join(order_items, "order_id") \
     .join(products, "product_id") \
     .join(categories, "category_id") \
     .join(departments, "department_id") \
-    .join(customers, "customer_id")
+    .filter(col("department").isin("Fitness", "Golf"))
 
-# Filter departments
-filtered = joined.filter(col("department").isin("Fitness", "Golf"))
+# --------------------------------------------------
+# 4. Aggregate total sales by department, state, year
+# --------------------------------------------------
 
-# Add year column
-filtered = filtered.withColumn("year", year("order_date"))
+sales_df = joined_df.groupBy(
+    "department", "state", "year"
+).agg(
+    sum("total_price").alias("total_sales")
+)
 
-# Aggregate total sales by department, state, year
-agg_df = filtered.groupBy("department", "state", "year").agg(_sum("total_price").alias("year_sales"))
+# --------------------------------------------------
+# 5. Pivot year (2013 vs 2014)
+# --------------------------------------------------
 
-# Pivot to get 2013 and 2014 sales
-pivot_df = agg_df.groupBy("department", "state") \
-    .pivot("year", [2013, 2014]) \
-    .agg(_sum("year_sales")) \
+pivot_df = sales_df.groupBy(
+    "department", "state"
+).pivot("year", [2013, 2014]) \
+ .sum("total_sales") \
+ .na.drop()
+
+pivot_df = pivot_df \
     .withColumnRenamed("2013", "2013_total_sales") \
     .withColumnRenamed("2014", "2014_total_sales")
 
-# Filter valid rows with sales in both years
-valid_df = pivot_df.filter((col("2013_total_sales").isNotNull()) & (col("2014_total_sales").isNotNull()) & (col("2013_total_sales") > 0))
+# --------------------------------------------------
+# 6. Calculate growth% + EXACT decimal formatting
+# --------------------------------------------------
 
-# Calculate growth%
-result_df = valid_df.withColumn("growth%", _round((col("2014_total_sales") - col("2013_total_sales")) / col("2013_total_sales") * 100, 2)) \
-    .withColumn("2013_total_sales", _round(col("2013_total_sales"), 1)) \
-    .withColumn("2014_total_sales", _round(col("2014_total_sales"), 1))
+formatted_df = pivot_df \
+    .withColumn(
+        "growth%",
+        bround(
+            ((col("2014_total_sales") - col("2013_total_sales")) /
+             col("2013_total_sales")) * 100, 2
+        ).cast(DecimalType(10, 2))
+    ) \
+    .withColumn(
+        "2013_total_sales",
+        bround(col("2013_total_sales"), 1).cast(DecimalType(10, 1))
+    ) \
+    .withColumn(
+        "2014_total_sales",
+        bround(col("2014_total_sales"), 1).cast(DecimalType(10, 1))
+    )
 
-# Rank top 3 states per department
-window_spec = Window.partitionBy("department").orderBy(desc("growth%"))
-ranked_df = result_df.withColumn("rank", row_number().over(window_spec)).filter(col("rank") <= 3).drop("rank")
+# --------------------------------------------------
+# 7. Top 3 states per department by growth%
+# --------------------------------------------------
 
-# Select and sort final columns
-final_df = ranked_df.select("department", "state", "2014_total_sales", "2013_total_sales", "growth%") \
-    .orderBy("department", desc("growth%"))
+window_spec = Window.partitionBy("department") \
+    .orderBy(col("growth%").desc())
 
-# Write output
-final_df.write.csv("question3", mode="overwrite", header=True)
+final_df = formatted_df \
+    .withColumn("rn", row_number().over(window_spec)) \
+    .filter(col("rn") <= 3) \
+    .drop("rn")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# from pyspark.sql import SparkSession
+# from pyspark.sql.functions import col, year, sum as _sum, round as _round, desc
+# from pyspark.sql.window import Window
+# from pyspark.sql.functions import row_number
+
+# # Start Spark session
+# spark = SparkSession.builder.getOrCreate()
+
+# # Load CSVs (assuming no headers)
+# orders = spark.read.csv("orders.csv", header=False, inferSchema=True).toDF("order_id", "order_date", "customer_id", "order_status")
+# order_items = spark.read.csv("order_items.csv", header=False, inferSchema=True).toDF("order_item_id", "order_id", "product_id", "quantity", "total_price", "unit_price")
+# products = spark.read.csv("products.csv", header=False, inferSchema=True).toDF("product_id", "category_id", "product", "type", "unit_price", "url")
+# categories = spark.read.csv("categories.csv", header=False, inferSchema=True).toDF("category_id", "department_id", "category")
+# departments = spark.read.csv("departments.csv", header=False, inferSchema=True).toDF("department_id", "department")
+# customers = spark.read.csv("customers.csv", header=False, inferSchema=True).toDF("customer_id", "first_name", "last_name", "email", "phone", "address", "city", "state", "zip")
+
+# # Filter orders with status COMPLETE
+# orders_filtered = orders.filter(col("order_status") == "COMPLETE")
+
+# # Join all datasets
+# joined = orders_filtered.join(order_items, "order_id") \
+#     .join(products, "product_id") \
+#     .join(categories, "category_id") \
+#     .join(departments, "department_id") \
+#     .join(customers, "customer_id")
+
+# # Filter departments
+# filtered = joined.filter(col("department").isin("Fitness", "Golf"))
+
+# # Add year column
+# filtered = filtered.withColumn("year", year("order_date"))
+
+# # Aggregate total sales by department, state, year
+# agg_df = filtered.groupBy("department", "state", "year").agg(_sum("total_price").alias("year_sales"))
+
+# # Pivot to get 2013 and 2014 sales
+# pivot_df = agg_df.groupBy("department", "state") \
+#     .pivot("year", [2013, 2014]) \
+#     .agg(_sum("year_sales")) \
+#     .withColumnRenamed("2013", "2013_total_sales") \
+#     .withColumnRenamed("2014", "2014_total_sales")
+
+# # Filter valid rows with sales in both years
+# valid_df = pivot_df.filter((col("2013_total_sales").isNotNull()) & (col("2014_total_sales").isNotNull()) & (col("2013_total_sales") > 0))
+
+# # Calculate growth%
+# result_df = valid_df.withColumn("growth%", _round((col("2014_total_sales") - col("2013_total_sales")) / col("2013_total_sales") * 100, 2)) \
+#     .withColumn("2013_total_sales", _round(col("2013_total_sales"), 1)) \
+#     .withColumn("2014_total_sales", _round(col("2014_total_sales"), 1))
+
+# # Rank top 3 states per department
+# window_spec = Window.partitionBy("department").orderBy(desc("growth%"))
+# ranked_df = result_df.withColumn("rank", row_number().over(window_spec)).filter(col("rank") <= 3).drop("rank")
+
+# # Select and sort final columns
+# final_df = ranked_df.select("department", "state", "2014_total_sales", "2013_total_sales", "growth%") \
+#     .orderBy("department", desc("growth%"))
+
+# # Write output
+# final_df.write.csv("question3", mode="overwrite", header=True)
